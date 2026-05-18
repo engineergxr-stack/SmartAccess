@@ -1,0 +1,103 @@
+{
+  "policy": {
+    "project_id": "customer_app",
+    "version": 1,
+    "issued_at": 1760000000,
+    "expires_at": 1791536000,
+
+    "config_sources": [
+      {
+        "id": "customer-policy",
+        "url": "https://config.customer.com/smartaccess/policy.signed.json",
+        "priority": 1,
+        "enabled": true
+      }
+    ],
+
+    "endpoints": [
+      {
+        "id": "api-sg",
+        "url": "https://api-sg.customer.com",
+        "kind": "http",
+        "role": "direct",
+        "health_path": "/healthy",
+        "priority": 1,
+        "enabled": true
+      },
+      {
+        "id": "api-hk",
+        "url": "https://api-hk.customer.com",
+        "kind": "http",
+        "role": "backup",
+        "health_path": "/healthy",
+        "priority": 2,
+        "enabled": true
+      },
+      {
+        "id": "relay-hk",
+        "url": "https://gateway-hk.customer.com",
+        "kind": "http",
+        "role": "relay",
+        "health_path": "/healthy",
+        "priority": 3,
+        "enabled": true
+      },
+      {
+        "id": "ws-hk",
+        "url": "wss://ws-hk.customer.com/health",
+        "kind": "websocket",
+        "role": "direct",
+        "priority": 4,
+        "enabled": true
+      }
+    ],
+
+    "dns_strategy": {
+      "mode": "system_first",
+      "fallback_resolvers": [
+        {
+          "id": "customer-httpdns",
+          "type": "https_json",
+          "url": "https://dns.customer.com/resolve"
+        },
+        {
+          "id": "customer-doh",
+          "type": "doh",
+          "url": "https://doh.customer.com/dns-query"
+        }
+      ],
+      "diagnostic_only": true
+    },
+
+    "ip_pools": [
+      {
+        "host": "api-sg.customer.com",
+        "ips": ["1.2.3.4", "1.2.3.5"],
+        "tls_server_name": "api-sg.customer.com",
+        "host_header": "api-sg.customer.com"
+      }
+    ],
+
+    "health_check": {
+      "timeout_ms": 2000,
+      "startup_max_wait_ms": 500,
+      "parallel_limit": 3
+    },
+
+    "websocket_check": {
+      "enabled": true,
+      "timeout_ms": 3000
+    },
+
+    "retry": {
+      "max_attempts": 2,
+      "retry_methods": ["GET", "HEAD"]
+    },
+
+    "circuit_breaker": {
+      "failure_threshold": 2,
+      "open_seconds": 60
+    }
+  },
+  "signature": "REPLACE_WITH_BASE64_ED25519_SIGNATURE_OF_POLICY_SORTED_JSON"
+}

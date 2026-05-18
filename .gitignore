@@ -1,0 +1,47 @@
+# Swift Package Manager / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcuserstate
+
+# Build artifacts
+*.o
+*.a
+*.dSYM/
+*.ipa
+*.xcarchive/
+build/
+
+# Generated
+Package.resolved
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Private (must never enter the repo)
+*.license
+*.signed.json
+private_key.bin
+*.p12
+*.pem
+*.key
+
+# Logs (local diagnostic export)
+*.log
+smartaccess-logs/
+
+# Coverage
+*.profdata
+*.profraw
+coverage/
