@@ -1,28 +1,36 @@
 import Foundation
 
-/// DNS 解析编排。第一版策略：diagnostic_only 默认 true，
-/// 即 SDK 仅做诊断报告，不会把业务请求改写为 https://IP。
+/// V2 升级：
+/// - V1 只做诊断（并发查多个 resolver 写报告）
+/// - V2 同时支持生产模式：把解析结果写入 `DNSCache`，业务侧（Relay IP 直连）可读取
 ///
-/// 即便如此，SDK 也会并发查询 system / httpDNS / DoH / static，
-/// 把结果汇总进 `DNSDiagnosticReport`，并写入 `ReachabilityReport` 的 path metadata。
+/// 策略：
+/// - 启动期对 policy 中所有 Relay endpoint 的 host 预热解析
+/// - 每个 host 优先级：HTTPDNS / DoH > Static > System（受 DNSStrategy.mode 影响）
+/// - 失败时回退到 stale 缓存（stale-while-revalidate）
 actor DNSResolverManager {
 
     private let systemResolver: SystemDNSResolver
     private var fallbackResolvers: [DNSResolver]
     private let log: SALog
+    private let cache: DNSCache
 
     init(fallbackResolvers: [DNSResolver], log: SALog) {
         self.systemResolver = SystemDNSResolver(id: "system")
         self.fallbackResolvers = fallbackResolvers
         self.log = log
+        self.cache = DNSCache()
     }
 
     func updateFallbackResolvers(_ resolvers: [DNSResolver]) {
         self.fallbackResolvers = resolvers
     }
 
-    /// 并发解析一个 host，所有 resolver 都参与，无论谁先返回都不会取消其他人，
-    /// 因为目的是「全量诊断」。
+    var dnsCache: DNSCache { cache }
+
+    // MARK: - 诊断（V1 已有）
+
+    /// 并发解析一个 host，所有 resolver 都参与，**不取消**，因为是诊断模式。
     func diagnose(host: String, timeoutMs: Int) async -> DNSDiagnosticReport {
         var resolvers: [DNSResolver] = [systemResolver]
         resolvers.append(contentsOf: fallbackResolvers)
@@ -36,15 +44,77 @@ actor DNSResolverManager {
             return collected
         }
 
+        // 顺手把成功的结果灌进缓存（生产模式可直接读）
+        for r in results where r.success {
+            await cache.record(host: r.host, ips: r.ips, source: r.source)
+        }
+
         let report = DNSDiagnosticReport(host: host, results: results)
         log.debug("DNS diagnostic for \(host): \(results.map { "\($0.resolverId)=\($0.ips)" })")
         return report
     }
+
+    // MARK: - 生产解析（V2 新增）
+
+    /// 生产模式解析：返回单个最权威的 IP 列表。
+    /// 优先级：HTTPDNS / DoH 任意先成功 → Static map → System DNS
+    /// 失败时回退 stale cache。
+    func resolveForProduction(host: String, timeoutMs: Int, preferFallback: Bool = false) async -> DNSResult? {
+        // 1. 缓存命中
+        if let hit = await cache.valid(host: host) {
+            return DNSResult(
+                host: host,
+                resolverId: "cache",
+                source: hit.source,
+                ips: hit.ips,
+                latencyMs: 0,
+                errorCode: nil
+            )
+        }
+
+        // 2. 按优先级跑
+        let orderedResolvers: [DNSResolver] = {
+            if preferFallback {
+                return fallbackResolvers + [systemResolver]
+            }
+            return [systemResolver] + fallbackResolvers
+        }()
+
+        for r in orderedResolvers {
+            let res = await r.resolve(host: host, timeoutMs: timeoutMs)
+            if res.success {
+                await cache.record(host: host, ips: res.ips, source: res.source)
+                return res
+            }
+        }
+
+        // 3. 全部失败：回 stale，让调用者决定要不要用
+        if let stale = await cache.stale(host: host) {
+            return DNSResult(
+                host: host,
+                resolverId: "cache-stale",
+                source: stale.source,
+                ips: stale.ips,
+                latencyMs: 0,
+                errorCode: "all_resolvers_failed_using_stale"
+            )
+        }
+        return nil
+    }
+
+    /// 预热一组 host（用于 Relay endpoint）。
+    func prewarm(hosts: [String], timeoutMs: Int) async {
+        await withTaskGroup(of: Void.self) { group in
+            for h in hosts {
+                group.addTask {
+                    _ = await self.resolveForProduction(host: h, timeoutMs: timeoutMs, preferFallback: true)
+                }
+            }
+        }
+    }
 }
 
-/// 用 `Network.framework` 的 NWConnection 间接驱动系统 DNS：
-/// 我们其实需要的是「能解析出来」，所以这里通过 CFHost API 拿同步结果。
-/// （CFHost 在 iOS 上仍然可用，且解析路径与 URLSession 一致。）
+/// 用 CFHost API 拿系统解析结果。第一版做法保持不变。
 struct SystemDNSResolver: DNSResolver {
     let id: String
     let source: DNSResult.Source = .system
@@ -91,8 +161,7 @@ struct SystemDNSResolver: DNSResolver {
                     NI_NUMERICHOST
                 )
                 if r == 0 {
-                    let s = String(cString: hostBuf)
-                    ips.append(s)
+                    ips.append(String(cString: hostBuf))
                 }
             }
         }

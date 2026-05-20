@@ -143,6 +143,89 @@ public final class SmartAccess: @unchecked Sendable {
         return await rt.engine.warmup()
     }
 
+    // MARK: - V2: 诊断包导出
+
+    /// 导出诊断包。客户在用户报问题时调用一次，拿到 manifest + 最近 ReachabilityReport + 日志。
+    /// 返回的目录由 SDK 创建；上传到客户工单系统由客户自行处理（SDK 不上报后台）。
+    public func exportDiagnosticBundle() async throws -> DiagnosticBundle {
+        guard let rt = currentRuntime() else { throw SmartAccessError.notStarted }
+        let report = await rt.engine.reachabilityReport()
+        let licenseId = await rt.licenseManager.currentLicense()?.licenseId
+        let policyVersion = await rt.policyResolver.currentPolicy?.version
+        let bundle = try await DiagnosticBundleBuilder.build(
+            targetDirectory: rt.config.diagnosticExportDirectoryURL,
+            storage: rt.config.localLogStorage,
+            report: report,
+            sdkVersion: rt.config.sdkVersion,
+            bundleId: rt.config.bundleId,
+            projectId: rt.config.projectId,
+            policyVersion: policyVersion,
+            licenseId: licenseId
+        )
+        rt.compositeSink.emit(.diagnosticBundleExported(
+            path: bundle.directory.path,
+            sizeBytes: bundle.totalBytes
+        ))
+        return bundle
+    }
+
+    /// 清空本地日志（不影响诊断包已导出的副本）。
+    public func purgeLocalLogs() async {
+        guard let rt = currentRuntime() else { return }
+        await rt.config.localLogStorage.purge()
+    }
+
+    // MARK: - V2: Relay IP 直连入口
+
+    /// 通过当前选中的 Relay endpoint 走 IP 直连发请求。
+    ///
+    /// **仅用于 Relay endpoint**。业务源站请求走客户自己的 URLSession + currentBaseURL 即可。
+    ///
+    /// 调用时机：
+    /// - 客户网络层在拼好 request 后，**先**判断 `await SmartAccess.shared.shouldUseRelayDirect()`
+    /// - 若 true，调用 `await SmartAccess.shared.sendViaRelayDirect(method:path:headers:body:)`
+    /// - 若 false，按 URLSession + currentBaseURL 走 V1 兼容路径
+    ///
+    /// 客户也可以一直走 V1 兼容路径，不用调这套 API——SDK 不会强制。
+    public func shouldUseRelayDirect() async -> Bool {
+        guard let rt = currentRuntime() else { return false }
+        guard let path = await rt.engine.currentSelectedPath(), path.kind == .relay else { return false }
+        // 只在 directIPMode 启用时才走
+        let mode = path.metadata["direct_ip_mode"] ?? "off"
+        return mode == "fallback" || mode == "always"
+    }
+
+    /// 走 Relay IP 直连发请求。失败抛 `RelayDirectTransport.DirectError`。
+    public func sendViaRelayDirect(
+        method: String,
+        path: String,
+        headers: [(String, String)] = [],
+        body: Data? = nil,
+        timeoutMs: Int = 10_000
+    ) async throws -> RelayDirectTransport.Response {
+        guard let rt = currentRuntime() else { throw SmartAccessError.notStarted }
+        guard let currentPath = await rt.engine.currentSelectedPath(),
+              currentPath.kind == .relay,
+              let endpointId = currentPath.endpointId else {
+            throw SmartAccessError.invalidEndpoint(reason: "current_path_is_not_relay")
+        }
+        guard let endpoint = await rt.endpointManager.endpoints.first(where: { $0.id == endpointId }) else {
+            throw SmartAccessError.invalidEndpoint(reason: "endpoint_not_found")
+        }
+        guard let execution = await rt.relayPathResolver.resolve(endpoint: endpoint, timeoutMs: timeoutMs) else {
+            throw SmartAccessError.invalidEndpoint(reason: "relay_no_ip_resolved")
+        }
+        let transport = RelayDirectTransport()
+        let req = RelayDirectTransport.Request(method: method, path: path, headers: headers, body: body)
+        return try await transport.send(
+            ip: execution.ip,
+            port: execution.port,
+            hostname: execution.hostname,
+            request: req,
+            timeoutMs: timeoutMs
+        )
+    }
+
     /// 关闭：清空运行时。调用者负责确保没有 in-flight 请求依赖 currentBaseURL。
     public func shutdown() {
         lock.lock()
@@ -182,24 +265,33 @@ extension SmartAccess {
 
     /// 启动完成后的运行时容器，封装所有 manager。
     final class Runtime {
+        let config: SmartAccessConfig
         let licenseManager: LicenseManager
         let policyResolver: PolicyResolver
         let endpointManager: EndpointManager
         let engine: ConnectivityEngine
         let initialPolicy: SmartAccessPolicy
+        let compositeSink: CompositeSink
+        let relayPathResolver: RelayPathResolver
 
         init(
+            config: SmartAccessConfig,
             licenseManager: LicenseManager,
             policyResolver: PolicyResolver,
             endpointManager: EndpointManager,
             engine: ConnectivityEngine,
-            initialPolicy: SmartAccessPolicy
+            initialPolicy: SmartAccessPolicy,
+            compositeSink: CompositeSink,
+            relayPathResolver: RelayPathResolver
         ) {
+            self.config = config
             self.licenseManager = licenseManager
             self.policyResolver = policyResolver
             self.endpointManager = endpointManager
             self.engine = engine
             self.initialPolicy = initialPolicy
+            self.compositeSink = compositeSink
+            self.relayPathResolver = relayPathResolver
         }
 
         static func build(config: SmartAccessConfig, log: SALog) async throws -> Runtime {
@@ -232,7 +324,11 @@ extension SmartAccess {
             let initialPolicy = try await resolver.bootstrap()
 
             // Probes / DNS / IP
-            let endpointManager = EndpointManager(circuitBreakerConfig: initialPolicy.circuitBreaker, log: log)
+            let endpointManager = EndpointManager(
+                circuitBreakerConfig: initialPolicy.circuitBreaker,
+                relayBreakerConfig: initialPolicy.relayCircuitBreaker,
+                log: log
+            )
             await endpointManager.setEndpoints(initialPolicy.endpoints)
 
             let dnsResolvers: [DNSResolver] = (initialPolicy.dnsStrategy?.fallbackResolvers ?? []).compactMap { r in
@@ -249,6 +345,18 @@ extension SmartAccess {
             }
             let dnsManager = DNSResolverManager(fallbackResolvers: dnsResolvers, log: log)
 
+            // V2: 复合 sink = 客户 sink + 本地日志 + escalation 判定
+            let filteredCustomer: SAMetricsSink = {
+                if let min = config.metricsMinSeverity {
+                    return FilteredMetricsSink(minSeverity: min, wrapped: config.metricsSink)
+                }
+                return config.metricsSink
+            }()
+            let compositeSink = CompositeSink(
+                customer: filteredCustomer,
+                storage: config.localLogStorage
+            )
+
             let engine = ConnectivityEngine(
                 initialPolicy: initialPolicy,
                 endpointManager: endpointManager,
@@ -257,16 +365,21 @@ extension SmartAccess {
                 dnsManager: dnsManager,
                 ipChecker: IPPoolChecker(),
                 licenseManager: licenseManager,
-                metrics: config.metricsSink,
+                metrics: compositeSink,
                 log: log
             )
 
+            let relayPathResolver = RelayPathResolver(dnsManager: dnsManager, log: log)
+
             return Runtime(
+                config: config,
                 licenseManager: licenseManager,
                 policyResolver: resolver,
                 endpointManager: endpointManager,
                 engine: engine,
-                initialPolicy: initialPolicy
+                initialPolicy: initialPolicy,
+                compositeSink: compositeSink,
+                relayPathResolver: relayPathResolver
             )
         }
     }

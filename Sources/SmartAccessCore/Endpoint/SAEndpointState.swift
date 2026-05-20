@@ -10,7 +10,10 @@ struct SAEndpointState: Sendable, Equatable {
     var consecutiveFailures: Int
     var consecutiveSuccesses: Int
     var lastErrorCode: String?
+    var lastErrorStage: ConnectivityStage?
     var breakerOpenUntil: Date?
+    // V2: half-open 探针
+    var nextHalfOpenProbeAt: Date?
 
     init() {
         self.lastProbeAt = nil
@@ -21,7 +24,9 @@ struct SAEndpointState: Sendable, Equatable {
         self.consecutiveFailures = 0
         self.consecutiveSuccesses = 0
         self.lastErrorCode = nil
+        self.lastErrorStage = nil
         self.breakerOpenUntil = nil
+        self.nextHalfOpenProbeAt = nil
     }
 
     /// 指数加权平均 latency，α 默认 0.3（新值权重）。

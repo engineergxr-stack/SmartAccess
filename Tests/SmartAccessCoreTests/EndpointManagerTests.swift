@@ -7,6 +7,7 @@ final class EndpointManagerTests: XCTestCase {
         let log = SALog(OSLoggerSink(minLevel: .warn))
         let mgr = EndpointManager(
             circuitBreakerConfig: CircuitBreakerConfig(failureThreshold: 2, openSeconds: 60),
+            relayBreakerConfig: .default,
             log: log
         )
         let ep = SAEndpoint(id: "a",

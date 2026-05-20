@@ -21,6 +21,10 @@ public struct SmartAccessPolicy: Codable, Sendable, Equatable {
     public let retry: RetryConfig
     public let circuitBreaker: CircuitBreakerConfig
 
+    // V2 新增
+    public let relayCircuitBreaker: RelayCircuitBreakerConfig
+    public let relayFailoverStrategy: RelayFailoverStrategy
+
     // MARK: - CodingKeys
 
     private enum CodingKeys: String, CodingKey {
@@ -36,6 +40,8 @@ public struct SmartAccessPolicy: Codable, Sendable, Equatable {
         case websocketCheck = "websocket_check"
         case retry
         case circuitBreaker = "circuit_breaker"
+        case relayCircuitBreaker  = "relay_circuit_breaker"
+        case relayFailoverStrategy = "relay_failover_strategy"
     }
 
     public init(from decoder: Decoder) throws {
@@ -57,6 +63,8 @@ public struct SmartAccessPolicy: Codable, Sendable, Equatable {
         self.websocketCheck = try c.decodeIfPresent(WebSocketCheckConfig.self, forKey: .websocketCheck) ?? .default
         self.retry          = try c.decodeIfPresent(RetryConfig.self,     forKey: .retry) ?? .default
         self.circuitBreaker = try c.decodeIfPresent(CircuitBreakerConfig.self, forKey: .circuitBreaker) ?? .default
+        self.relayCircuitBreaker = try c.decodeIfPresent(RelayCircuitBreakerConfig.self, forKey: .relayCircuitBreaker) ?? .default
+        self.relayFailoverStrategy = try c.decodeIfPresent(RelayFailoverStrategy.self, forKey: .relayFailoverStrategy) ?? .nearest
     }
 
     public init(
@@ -71,7 +79,9 @@ public struct SmartAccessPolicy: Codable, Sendable, Equatable {
         healthCheck: HealthCheckConfig = .default,
         websocketCheck: WebSocketCheckConfig = .default,
         retry: RetryConfig = .default,
-        circuitBreaker: CircuitBreakerConfig = .default
+        circuitBreaker: CircuitBreakerConfig = .default,
+        relayCircuitBreaker: RelayCircuitBreakerConfig = .default,
+        relayFailoverStrategy: RelayFailoverStrategy = .nearest
     ) {
         self.projectId = projectId
         self.version = version
@@ -85,6 +95,8 @@ public struct SmartAccessPolicy: Codable, Sendable, Equatable {
         self.websocketCheck = websocketCheck
         self.retry = retry
         self.circuitBreaker = circuitBreaker
+        self.relayCircuitBreaker = relayCircuitBreaker
+        self.relayFailoverStrategy = relayFailoverStrategy
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -101,6 +113,8 @@ public struct SmartAccessPolicy: Codable, Sendable, Equatable {
         try c.encode(websocketCheck, forKey: .websocketCheck)
         try c.encode(retry,          forKey: .retry)
         try c.encode(circuitBreaker, forKey: .circuitBreaker)
+        try c.encode(relayCircuitBreaker, forKey: .relayCircuitBreaker)
+        try c.encode(relayFailoverStrategy, forKey: .relayFailoverStrategy)
     }
 }
 
@@ -235,4 +249,32 @@ public struct CircuitBreakerConfig: Codable, Sendable, Equatable {
     }
 
     public static let `default` = CircuitBreakerConfig()
+}
+
+/// V2: Relay 专属熔断参数。Relay 用更高 failureThreshold + 更短 openSeconds + half-open probe。
+public struct RelayCircuitBreakerConfig: Codable, Sendable, Equatable {
+    public let failureThreshold: Int
+    public let openSeconds: Int
+    public let halfOpenProbeIntervalSeconds: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case failureThreshold = "failure_threshold"
+        case openSeconds = "open_seconds"
+        case halfOpenProbeIntervalSeconds = "half_open_probe_interval_seconds"
+    }
+
+    public init(failureThreshold: Int = 3, openSeconds: Int = 30, halfOpenProbeIntervalSeconds: Int = 10) {
+        self.failureThreshold = failureThreshold
+        self.openSeconds = openSeconds
+        self.halfOpenProbeIntervalSeconds = halfOpenProbeIntervalSeconds
+    }
+
+    public static let `default` = RelayCircuitBreakerConfig()
+}
+
+/// V2: 多 Relay 之间的 failover 策略。
+public enum RelayFailoverStrategy: String, Codable, Sendable, Equatable {
+    case nearest       // 默认。按 EMA latency 选最快
+    case roundRobin    // 轮换（请求级别），用于负载分布
+    case weighted      // 按 priority 加权
 }

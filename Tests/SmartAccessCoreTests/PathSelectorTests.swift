@@ -27,13 +27,14 @@ final class PathSelectorTests: XCTestCase {
             states[id] = s
         }
 
-        let chosen = PathSelector().selectBest(
+        var selector = PathSelector()
+        let chosen = selector.selectBest(
             candidates: [direct, backup, relay],
             endpointStates: states,
             endpointsById: endpoints,
             current: nil
         )
-        XCTAssertEqual(chosen?.id, "p1")
+        XCTAssertEqual(chosen.path?.id, "p1")
     }
 
     func testSkipsBreakerOpen() {
@@ -54,12 +55,50 @@ final class PathSelectorTests: XCTestCase {
 
         let states = ["a": sA, "b": sB]
 
-        let chosen = PathSelector().selectBest(
+        var selector = PathSelector()
+        let chosen = selector.selectBest(
             candidates: [direct, backup],
             endpointStates: states,
             endpointsById: endpoints,
             current: nil
         )
-        XCTAssertEqual(chosen?.id, "p2")
+        XCTAssertEqual(chosen.path?.id, "p2")
+    }
+
+    /// V2: 所有 direct/backup 都死在 dns 阶段时，Relay 必须被立刻提到首选。
+    func testRelayPromotedWhenAllDirectsDeadOnDNS() {
+        let direct = ConnectivityPath(id: "p1", kind: .directDomain,
+                                      baseURL: URL(string: "https://a.example.com")!,
+                                      endpointId: "a", priority: 1)
+        let relay  = ConnectivityPath(id: "p2", kind: .relay,
+                                      baseURL: URL(string: "https://gw.example.com")!,
+                                      endpointId: "gw", priority: 3)
+        let endpoints: [String: SAEndpoint] = [
+            "a":  .init(id: "a",  url: direct.baseURL, kind: .http, role: .direct, priority: 1),
+            "gw": .init(id: "gw", url: relay.baseURL,  kind: .http, role: .relay,  priority: 3),
+        ]
+
+        var sA = SAEndpointState()
+        sA.consecutiveFailures = 2
+        sA.lastFailureAt = Date()
+        sA.lastErrorStage = .dns
+        sA.breakerOpenUntil = Date().addingTimeInterval(-1) // 已恢复，但 lastErrorStage 还是 dns
+
+        var sGW = SAEndpointState()
+        sGW.recordLatency(180); sGW.consecutiveSuccesses = 2
+
+        // 注意：breakerOpenUntil 在过去，因此 A 仍然在候选里。我们要测的是「即使 A 在候选里，
+        // 但因为最近失败在 dns 阶段，PathSelector 也应该提权 Relay」。
+        let states = ["a": sA, "gw": sGW]
+
+        var selector = PathSelector()
+        let chosen = selector.selectBest(
+            candidates: [direct, relay],
+            endpointStates: states,
+            endpointsById: endpoints,
+            current: nil
+        )
+        XCTAssertEqual(chosen.path?.id, "p2", "expected relay promoted")
+        XCTAssertTrue(chosen.reason.contains("relay_promoted"))
     }
 }
